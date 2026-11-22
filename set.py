@@ -241,6 +241,22 @@ def make_driver():
 
     raise RuntimeError("ไม่พบ Chrome หรือ Edge ในระบบ")
 
+def verify_driver():
+    """ทดสอบเปิด Chrome 1 ครั้งก่อนเริ่มงานจริง (Fail-fast + อุ่น Selenium Manager cache)"""
+    print("🧪 กำลังทดสอบเปิด WebDriver...")
+    driver = make_driver()
+    try:
+        browser_ver = driver.capabilities.get("browserVersion", "unknown")
+        driver_ver = (
+            driver.capabilities.get("chrome", {}).get("chromedriverVersion", "").split(" ")[0]
+            or "unknown"
+        )
+        print(f"✅ WebDriver พร้อมใช้งาน (Browser: {browser_ver}, Driver: {driver_ver})")
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 def setup_environment():
     """เตรียม Folder และดาวน์โหลด/แปลงไฟล์ Master จาก SET เป็น CSV"""
@@ -473,6 +489,7 @@ def scrape_urls_parallel(urls, max_workers, action_label="Scraped", show_rows=Fa
         if worker_idx > 0:
             time.sleep(worker_idx * 0.5)
 
+        consecutive_init_errors = 0
         while True:
             try:
                 url = url_queue.get(timeout=3)
@@ -483,6 +500,7 @@ def scrape_urls_parallel(urls, max_workers, action_label="Scraped", show_rows=Fa
             urls_processed = 0
             try:
                 driver = make_driver()
+                consecutive_init_errors = 0
                 while url is not None:
                     need_restart = False
                     symbol = url.split("/")[-2]
@@ -555,13 +573,19 @@ def scrape_urls_parallel(urls, max_workers, action_label="Scraped", show_rows=Fa
                         url = None
 
             except Exception as e:
-                print(f"🔥 Worker Initialization Error: {e}")
+                consecutive_init_errors += 1
+                print(
+                    f"🔥 Worker Initialization Error ({consecutive_init_errors}/3): {e}"
+                )
                 with retry_lock:
                     count = retry_count.get(url, 0)
                     if count < MAX_RETRY_PER_URL:
                         retry_count[url] = count + 1
                         url_queue.put(url)
                 url_queue.task_done()
+                if consecutive_init_errors >= 3:
+                    print("🛑 หยุด Worker นี้เนื่องจากเปิด Browser ไม่สำเร็จติดต่อกัน 3 ครั้ง")
+                    break
                 time.sleep(3)
             finally:
                 if driver:
@@ -881,6 +905,9 @@ def main():
     start_time = time.time()
     kill_orphan_chrome()
 
+    # ทดสอบเปิด Chrome ก่อนเริ่ม ถ้าเปิดไม่ได้ให้หยุดทันทีไม่วนลูปยาว
+    verify_driver()
+    
     # ---- STEP 1: SCRAPE ----
     df_master = setup_environment()
 
