@@ -46,19 +46,26 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Set up Google Chrome
-        id: setup-chrome
-        uses: browser-actions/setup-chrome@v1
-
+      - name: Verify Chrome & ChromeDriver compatibility
+        run: |
+          CHROME_VER=$(google-chrome --version 2>/dev/null | grep -oE '[0-9]+' | head -n1 || true)
+          DRIVER_PATH=$(command -v chromedriver || true)
+          DRIVER_VER=$(chromedriver --version 2>/dev/null | grep -oE '[0-9]+' | head -n1 || true)
+          echo "Chrome major version: ${CHROME_VER:-not found}"
+          echo "ChromeDriver major version: ${DRIVER_VER:-not found} (${DRIVER_PATH:-none})"
+          if [ -n "$DRIVER_PATH" ] && [ "$CHROME_VER" != "$DRIVER_VER" ]; then
+            echo "⚠️ Version mismatch — removing $DRIVER_PATH so Selenium Manager downloads the matching version"
+            sudo rm -f "$DRIVER_PATH"
+          fi
+          
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
+          
       - name: Run SET scraper
         env:
           PYTHONUNBUFFERED: '1'
-          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
           MAX_WORKERS: ${{ inputs.max_workers || '3' }}
           TEST_STOCKS: ${{ inputs.test_stocks || '' }}
         run: python set.py
