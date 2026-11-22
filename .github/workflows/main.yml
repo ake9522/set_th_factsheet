@@ -1,0 +1,92 @@
+name: SET Factsheet Scraper
+
+on:
+  # รันอัตโนมัติตามเวลาที่กำหนด (เวลาใน GitHub Actions เป็น UTC = เวลาไทย - 7 ชม.)
+  # ตัวอย่าง: '0 15 * * 1-5' = วันจันทร์-ศุกร์ เวลา 22:00 น. ตามเวลาประเทศไทย (ICT)
+  schedule:
+    - cron: '0 15 * * 1-5'
+
+  # กดสั่งรันเองได้จากหน้า GitHub Actions (พร้อมตัวเลือกสำหรับทดสอบ)
+  workflow_dispatch:
+    inputs:
+      test_stocks:
+        description: 'หุ้นสำหรับทดสอบ (คั่นด้วย , เช่น ADVANC,PTT — เว้นว่างเพื่อดึงทั้งหมด)'
+        required: false
+        default: ''
+        type: string
+      max_workers:
+        description: 'จำนวน Chrome workers ที่รันพร้อมกัน (แนะนำ 2-4)'
+        required: false
+        default: '3'
+        type: string
+
+# สิทธิ์ในการ commit และ push ไฟล์ CSV กลับเข้า repository
+permissions:
+  contents: write
+
+# ป้องกันไม่ให้รันซ้อนกัน
+concurrency:
+  group: set-factsheet-scraper
+  cancel-in-progress: false
+
+jobs:
+  scrape-set:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Set up Google Chrome
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run SET scraper
+        env:
+          PYTHONUNBUFFERED: '1'
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+          MAX_WORKERS: ${{ inputs.max_workers || '3' }}
+          TEST_STOCKS: ${{ inputs.test_stocks || '' }}
+        run: python set.py
+
+      - name: Upload test output as artifact (Test Mode only)
+        if: ${{ inputs.test_stocks != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: set-test-output
+          path: |
+            data_factsheet/
+            listedCompanies_th_TH.csv
+          retention-days: 7
+
+      - name: Commit and push updated data
+        if: ${{ inputs.test_stocks == '' }}
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          # ใช้ -f เพื่อให้เพิ่มไฟล์ได้แม้ .gitignore จะ ignore โฟลเดอร์ data_factsheet/ ไว้
+          git add -f -A data_factsheet/ listedCompanies_th_TH.csv
+
+          if git diff --staged --quiet; then
+            echo "ℹ️ ไม่มีข้อมูลเปลี่ยนแปลง ข้ามการ commit"
+          else
+            TIMESTAMP=$(TZ=Asia/Bangkok date '+%Y-%m-%d %H:%M ICT')
+            git commit -m "chore: update SET factsheet data (${TIMESTAMP})"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push
+          fi
