@@ -54,12 +54,12 @@ if hasattr(sys.stdout, "reconfigure"):
 # ==========================================
 IS_CI = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
 
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3" if IS_CI else "6"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5" if IS_CI else "6"))
 HEADLESS_MODE = os.getenv("HEADLESS_MODE", "true").lower() != "false"
-WAIT_TIMEOUT = int(os.getenv("WAIT_TIMEOUT", "15" if IS_CI else "10"))
+WAIT_TIMEOUT = int(os.getenv("WAIT_TIMEOUT", "10"))
 PAGE_LOAD_TIMEOUT = int(os.getenv("PAGE_LOAD_TIMEOUT", "45"))
-MAX_URLS_PER_DRIVER = int(os.getenv("MAX_URLS_PER_DRIVER", "25" if IS_CI else "50"))
-MAX_RETRY_PER_URL = int(os.getenv("MAX_RETRY_PER_URL", "2"))
+MAX_URLS_PER_DRIVER = int(os.getenv("MAX_URLS_PER_DRIVER", "100"))
+MAX_RETRY_PER_URL = int(os.getenv("MAX_RETRY_PER_URL", "1"))
 
 # Path Configuration (ใช้ตำแหน่งไฟล์ set.py เป็นหลัก จึงรันได้ทั้ง Local และ GitHub Actions)
 BASE_DIR = Path(__file__).resolve().parent
@@ -208,7 +208,7 @@ def make_driver():
                 with DRIVER_INIT_LOCK:
                     service = webdriver.ChromeService(log_path=os.devnull)
                     driver = webdriver.Chrome(options=opts, service=service)
-                driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+                
                 return driver
             except Exception as e:
                 last_err = e
@@ -236,8 +236,24 @@ def make_driver():
         eopts.add_argument("--no-sandbox")
         with DRIVER_INIT_LOCK:
             driver = EdgeDriver(options=eopts)
-        driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
-        return driver
+                driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+                # บล็อกทรัพยากรที่ไม่จำเป็น (รูป/ฟอนต์/ตัวติดตาม) ช่วยให้หน้าเว็บโหลดเร็วขึ้นมาก
+                try:
+                    driver.execute_cdp_cmd("Network.enable", {})
+                    driver.execute_cdp_cmd(
+                        "Network.setBlockedURLs",
+                        {
+                            "urls": [
+                                "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg", "*.ico",
+                                "*.woff", "*.woff2", "*.ttf", "*.eot",
+                                "*google-analytics*", "*googletagmanager*", "*doubleclick*",
+                                "*facebook*", "*hotjar*", "*clarity.ms*",
+                            ]
+                        },
+                    )
+                except Exception:
+                    pass
+                return driver
 
     raise RuntimeError("ไม่พบ Chrome หรือ Edge ในระบบ")
 
@@ -492,7 +508,7 @@ def scrape_urls_parallel(urls, max_workers, action_label="Scraped", show_rows=Fa
         consecutive_init_errors = 0
         while True:
             try:
-                url = url_queue.get(timeout=3)
+                url = url_queue.get(timeout=0.5)
             except queue.Empty:
                 break
 
@@ -614,6 +630,30 @@ def rows_to_dataframe(rows):
     padded_data = [r + [None] * (max_cols - len(r)) for r in rows]
     return pd.DataFrame(padded_data, columns=cols)
 
+SECTOR_NAME_MAP = {
+    "AGRO": "agro_company.csv",
+    "CONSUMP": "consump_company.csv",
+    "FINCIAL": "fincial_company.csv",
+    "INDUS": "indus_company.csv",
+    "PROPCON": "propcon_company.csv",
+    "RESOURC": "resourc_company.csv",
+    "SERVICE": "service_company.csv",
+    "TECH": "tech_company.csv",
+    "-": "na_company.csv",
+}
+
+
+def save_sector_rows(sector_name, sector_data):
+    """บันทึกข้อมูลของ 1 Sector ลงไฟล์ CSV"""
+    if sector_data:
+        df_out = rows_to_dataframe(sector_data)
+        filename = SECTOR_NAME_MAP.get(sector_name, f"{sector_name.lower()}_company.csv")
+        out_path = os.path.join(LOCAL_PATH_DATA, filename)
+        df_out.to_csv(out_path, index=False, encoding="utf-8-sig")
+        print(f"💾 บันทึก {filename} เรียบร้อย ({len(df_out)} rows)")
+    else:
+        print(f"⚠️ ไม่มีข้อมูลสำหรับ {sector_name}")
+
 
 def process_sector(sector_name, stock_list):
     """จัดการการดึงข้อมูลของ 1 Sector"""
@@ -625,26 +665,34 @@ def process_sector(sector_name, stock_list):
     ]
 
     sector_data = scrape_urls_parallel(urls, MAX_WORKERS, action_label="Scraped")
+    save_sector_rows(sector_name, sector_data)
 
-    if sector_data:
-        df_out = rows_to_dataframe(sector_data)
-        name_map = {
-            "AGRO": "agro_company.csv",
-            "CONSUMP": "consump_company.csv",
-            "FINCIAL": "fincial_company.csv",
-            "INDUS": "indus_company.csv",
-            "PROPCON": "propcon_company.csv",
-            "RESOURC": "resourc_company.csv",
-            "SERVICE": "service_company.csv",
-            "TECH": "tech_company.csv",
-            "-": "na_company.csv",
-        }
-        filename = name_map.get(sector_name, f"{sector_name.lower()}_company.csv")
-        out_path = os.path.join(LOCAL_PATH_DATA, filename)
-        df_out.to_csv(out_path, index=False, encoding="utf-8-sig")
-        print(f"💾 บันทึก {filename} เรียบร้อย ({len(df_out)} rows)")
-    else:
-        print(f"⚠️ ไม่มีข้อมูลสำหรับ {sector_name}")
+
+def process_all_sectors(sector_stocks):
+    """ดึงหลาย Sector ด้วย Browser Pool ชุดเดียว แล้วแยกเซฟเป็น CSV ตามกลุ่ม (ไม่ต้องปิด-เปิด Chrome ใหม่ทุกกลุ่ม)"""
+    all_urls = []
+    url_to_sector = {}
+    sector_rows = {}
+
+    for sector_en, stock_list in sector_stocks:
+        sector_rows[sector_en] = []
+        for stock in stock_list:
+            url = f"https://www.set.or.th/th/market/product/stock/quote/{stock}/factsheet"
+            all_urls.append(url)
+            url_to_sector[url] = sector_en
+
+    sector_summary = ", ".join(f"{sec}({len(stocks)})" for sec, stocks in sector_stocks)
+    print(f"\n🚀 เริ่มประมวลผลรวม {len(all_urls)} บริษัท [{sector_summary}] ด้วย Browser Pool ชุดเดียว")
+
+    all_rows = scrape_urls_parallel(all_urls, MAX_WORKERS, action_label="Scraped")
+
+    for row in all_rows:
+        sec = url_to_sector.get(row[1])
+        if sec is not None:
+            sector_rows[sec].append(row)
+
+    for sector_en, _ in sector_stocks:
+        save_sector_rows(sector_en, sector_rows[sector_en])
 
 
 # ==========================================
@@ -675,15 +723,16 @@ def _missing_condition(df):
     return mask_col1 | mask_col3
 
 
-def script_a_check(save_summary=True):
+def script_a_check(save_summary=True, bases=None):
     """Script A/D: ตรวจสอบข้อมูลที่ขาดหาย และสร้างไฟล์ _missing_data_summary.csv"""
     pd.set_option("display.max_colwidth", None)
     pd.set_option("display.expand_frame_repr", False)
 
     folder = Path(LOCAL_PATH_DATA)
+    target_bases = bases if bases is not None else SECTOR_BASES
     all_results = []
 
-    for base in SECTOR_BASES:
+    for base in target_bases:
         file_path = folder / f"{base}.csv"
         print(f"\n===== {base} =====")
         try:
@@ -721,12 +770,13 @@ def script_a_check(save_summary=True):
         print(f"\n💾 บันทึกสรุปที่: {out_path}")
 
 
-def script_b_delete(apply_delete=True):
+def script_b_delete(apply_delete=True, bases=None):
     """Script B: Cascade Delete ทุกแถวของ URL ที่ข้อมูลไม่ครบ"""
     folder = Path(LOCAL_PATH_DATA)
+    target_bases = bases if bases is not None else SECTOR_BASES
     summary = []
 
-    for base in SECTOR_BASES:
+    for base in target_bases:
         file_path = folder / f"{base}.csv"
         print(f"\n===== {base} =====")
         try:
@@ -878,6 +928,12 @@ def parse_args():
         help=f"จำนวน Chrome workers พร้อมกัน (default: {MAX_WORKERS})",
     )
     parser.add_argument(
+        "--sectors",
+        type=str,
+        default=os.getenv("SECTORS", ""),
+        help="เลือกเฉพาะบาง Sector คั่นด้วยจุลภาค เช่น AGRO,FINCIAL (เว้นว่าง = ทุกกลุ่ม)",
+    )
+    parser.add_argument(
         "--test-stocks",
         type=str,
         default=os.getenv("TEST_STOCKS", ""),
@@ -899,7 +955,7 @@ def main():
     print(
         f"⚙️ Config: IS_CI={IS_CI}, MAX_WORKERS={MAX_WORKERS}, "
         f"HEADLESS={HEADLESS_MODE}, WAIT_TIMEOUT={WAIT_TIMEOUT}s, "
-        f"MAX_URLS_PER_DRIVER={MAX_URLS_PER_DRIVER}"
+        f"MAX_URLS_PER_DRIVER={MAX_URLS_PER_DRIVER}, MAX_RETRY_PER_URL={MAX_RETRY_PER_URL}"
     )
 
     start_time = time.time()
@@ -907,7 +963,7 @@ def main():
 
     # ทดสอบเปิด Chrome ก่อนเริ่ม ถ้าเปิดไม่ได้ให้หยุดทันทีไม่วนลูปยาว
     verify_driver()
-    
+
     # ---- STEP 1: SCRAPE ----
     df_master = setup_environment()
 
@@ -919,7 +975,7 @@ def main():
         print(f"\n✨ เสร็จสิ้นการทดสอบในเวลา: {elapsed / 60:.2f} นาที ✨")
         return
 
-    sectors = [
+    all_sectors = [
         ("เกษตรและอุตสาหกรรมอาหาร", "AGRO"),
         ("สินค้าอุปโภคบริโภค", "CONSUMP"),
         ("ธุรกิจการเงิน", "FINCIAL"),
@@ -931,6 +987,17 @@ def main():
         ("-", "-"),
     ]
 
+    selected_sectors = {
+        s.strip().upper() for s in args.sectors.split(",") if s.strip()
+    }
+    sectors = [
+        (th, en)
+        for th, en in all_sectors
+        if not selected_sectors or en in selected_sectors
+    ]
+
+    sector_stocks = []
+    target_bases = []
     for sector_th, sector_en in sectors:
         stock_list = df_master.loc[
             df_master["กลุ่มอุตสาหกรรม"] == sector_th, "หลักทรัพย์"
@@ -940,12 +1007,18 @@ def main():
             print(f"ข้าม {sector_en} (ไม่พบหุ้น)")
             continue
 
-        process_sector(sector_en, stock_list)
+        sector_stocks.append((sector_en, stock_list))
+        target_bases.append(
+            SECTOR_NAME_MAP.get(sector_en, f"{sector_en.lower()}_company.csv").replace(".csv", "")
+        )
+
+    if sector_stocks:
+        process_all_sectors(sector_stocks)
 
     elapsed = time.time() - start_time
     print(f"\n✨ เสร็จสิ้นการดึงข้อมูลรอบแรกในเวลา: {elapsed / 60:.2f} นาที ✨")
 
-    if args.skip_verify:
+    if args.skip_verify or not target_bases:
         return
 
     # ---- STEP 2: VERIFY & RETRY ----
@@ -954,16 +1027,16 @@ def main():
     print("=" * 50)
 
     print("\n[A] Check missing data...")
-    script_a_check(save_summary=True)
+    script_a_check(save_summary=True, bases=target_bases)
 
     print("\n[B] Cascade delete incomplete data...")
-    script_b_delete(apply_delete=True)
+    script_b_delete(apply_delete=True, bases=target_bases)
 
     print("\n[C] Refresh missing data...")
     script_c_refresh()
 
     print("\n[D] Verify after refresh...")
-    script_a_check(save_summary=False)
+    script_a_check(save_summary=False, bases=target_bases)
 
     print("\n[E] Cleanup summary file...")
     script_e_cleanup()
