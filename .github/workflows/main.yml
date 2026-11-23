@@ -17,7 +17,7 @@ on:
       max_workers:
         description: 'จำนวน Chrome workers ต่อเครื่อง (แนะนำ 2-3 เพื่อไม่ให้โดน Rate Limit)'
         required: false
-        default: '2'
+        default: '3'
         type: string
 
 # สิทธิ์ในการ commit และ push ไฟล์ CSV กลับเข้า repository
@@ -70,7 +70,7 @@ jobs:
       - name: Run SET scraper (Test Mode)
         env:
           PYTHONUNBUFFERED: '1'
-          MAX_WORKERS: ${{ inputs.max_workers || '2' }}
+          MAX_WORKERS: ${{ inputs.max_workers || '3' }}
           TEST_STOCKS: ${{ inputs.test_stocks }}
         run: python set.py
 
@@ -138,7 +138,7 @@ jobs:
       - name: Run SET scraper (${{ matrix.sectors }})
         env:
           PYTHONUNBUFFERED: '1'
-          MAX_WORKERS: ${{ inputs.max_workers || '2' }}
+          MAX_WORKERS: ${{ inputs.max_workers || '3' }}
           SECTORS: ${{ matrix.sectors }}
         run: python set.py
 
