@@ -4,7 +4,7 @@ on:
   # รันอัตโนมัติตามเวลาที่กำหนด (เวลาใน GitHub Actions เป็น UTC = เวลาไทย - 7 ชม.)
   # ตัวอย่าง: '0 15 * * 1-5' = วันจันทร์-ศุกร์ เวลา 22:00 น. ตามเวลาประเทศไทย (ICT)
   schedule:
-    # - cron: '0 15 * * 1-5'
+    - cron: '0 15 * * 1-5'
 
   # กดสั่งรันเองได้จากหน้า GitHub Actions (พร้อมตัวเลือกสำหรับทดสอบ)
   workflow_dispatch:
@@ -15,9 +15,9 @@ on:
         default: ''
         type: string
       max_workers:
-        description: 'จำนวน Chrome workers ที่รันพร้อมกัน (แนะนำ 2-4)'
+        description: 'จำนวน Chrome workers ต่อเครื่อง (แนะนำ 4-6)'
         required: false
-        default: '3'
+        default: '5'
         type: string
 
 # สิทธิ์ในการ commit และ push ไฟล์ CSV กลับเข้า repository
@@ -30,9 +30,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  scrape-set:
+  # ==========================================
+  # MODE 1: TEST MODE (ทำงานเมื่อกรอก test_stocks)
+  # ==========================================
+  test-run:
+    if: ${{ inputs.test_stocks != '' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -57,21 +61,20 @@ jobs:
             echo "⚠️ Version mismatch — removing $DRIVER_PATH so Selenium Manager downloads the matching version"
             sudo rm -f "$DRIVER_PATH"
           fi
-          
+
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          
-      - name: Run SET scraper
+
+      - name: Run SET scraper (Test Mode)
         env:
           PYTHONUNBUFFERED: '1'
-          MAX_WORKERS: ${{ inputs.max_workers || '3' }}
-          TEST_STOCKS: ${{ inputs.test_stocks || '' }}
+          MAX_WORKERS: ${{ inputs.max_workers || '5' }}
+          TEST_STOCKS: ${{ inputs.test_stocks }}
         run: python set.py
 
-      - name: Upload test output as artifact (Test Mode only)
-        if: ${{ inputs.test_stocks != '' }}
+      - name: Upload test output as artifact
         uses: actions/upload-artifact@v4
         with:
           name: set-test-output
@@ -80,8 +83,106 @@ jobs:
             listedCompanies_th_TH.csv
           retention-days: 7
 
+  # ==========================================
+  # MODE 2: FULL RUN แบบ Matrix 5 เครื่องพร้อมกัน (~5-8 นาที)
+  # ==========================================
+  scrape-matrix:
+    if: ${{ inputs.test_stocks == '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # แบ่ง 9 กลุ่มเป็น 5 ก้อนที่มีจำนวนหุ้นใกล้เคียงกัน (~150-212 หุ้น/เครื่อง)
+        include:
+          - name: propcon
+            sectors: 'PROPCON'
+          - name: service
+            sectors: 'SERVICE'
+          - name: indus
+            sectors: 'INDUS'
+          - name: agro-fincial
+            sectors: 'AGRO,FINCIAL'
+          - name: consump-resourc-tech
+            sectors: 'CONSUMP,RESOURC,TECH,-'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Verify Chrome & ChromeDriver compatibility
+        run: |
+          CHROME_VER=$(google-chrome --version 2>/dev/null | grep -oE '[0-9]+' | head -n1 || true)
+          DRIVER_PATH=$(command -v chromedriver || true)
+          DRIVER_VER=$(chromedriver --version 2>/dev/null | grep -oE '[0-9]+' | head -n1 || true)
+          echo "Chrome major version: ${CHROME_VER:-not found}"
+          echo "ChromeDriver major version: ${DRIVER_VER:-not found} (${DRIVER_PATH:-none})"
+          if [ -n "$DRIVER_PATH" ] && [ "$CHROME_VER" != "$DRIVER_VER" ]; then
+            echo "⚠️ Version mismatch — removing $DRIVER_PATH so Selenium Manager downloads the matching version"
+            sudo rm -f "$DRIVER_PATH"
+          fi
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run SET scraper (${{ matrix.sectors }})
+        env:
+          PYTHONUNBUFFERED: '1'
+          MAX_WORKERS: ${{ inputs.max_workers || '5' }}
+          SECTORS: ${{ matrix.sectors }}
+        run: python set.py
+
+      - name: Upload sector CSVs
+        uses: actions/upload-artifact@v4
+        with:
+          name: factsheet-${{ matrix.name }}
+          path: |
+            data_factsheet/*.csv
+            listedCompanies_th_TH.csv
+          retention-days: 1
+
+  # ==========================================
+  # รวมไฟล์จากทั้ง 5 เครื่องแล้ว Commit & Push ครั้งเดียว
+  # ==========================================
+  merge-and-commit:
+    if: ${{ inputs.test_stocks == '' }}
+    needs: scrape-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download all sector CSVs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: factsheet-*
+          merge-multiple: true
+          path: _artifacts
+
+      - name: Assemble updated CSV files
+        run: |
+          rm -rf data_factsheet
+          mkdir -p data_factsheet
+          cp -f _artifacts/data_factsheet/*.csv data_factsheet/
+          cp -f _artifacts/listedCompanies_th_TH.csv ./listedCompanies_th_TH.csv
+          rm -rf _artifacts
+          ls -lh data_factsheet/ listedCompanies_th_TH.csv
+
       - name: Commit and push updated data
-        if: ${{ inputs.test_stocks == '' }}
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
