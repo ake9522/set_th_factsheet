@@ -208,7 +208,23 @@ def make_driver():
                 with DRIVER_INIT_LOCK:
                     service = webdriver.ChromeService(log_path=os.devnull)
                     driver = webdriver.Chrome(options=opts, service=service)
-                
+                driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+                # บล็อกทรัพยากรที่ไม่จำเป็น (รูป/ฟอนต์/ตัวติดตาม) ช่วยให้หน้าเว็บโหลดเร็วขึ้นมาก
+                try:
+                    driver.execute_cdp_cmd("Network.enable", {})
+                    driver.execute_cdp_cmd(
+                        "Network.setBlockedURLs",
+                        {
+                            "urls": [
+                                "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg", "*.ico",
+                                "*.woff", "*.woff2", "*.ttf", "*.eot",
+                                "*google-analytics*", "*googletagmanager*", "*doubleclick*",
+                                "*facebook*", "*hotjar*", "*clarity.ms*",
+                            ]
+                        },
+                    )
+                except Exception:
+                    pass
                 return driver
             except Exception as e:
                 last_err = e
@@ -236,24 +252,8 @@ def make_driver():
         eopts.add_argument("--no-sandbox")
         with DRIVER_INIT_LOCK:
             driver = EdgeDriver(options=eopts)
-                driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
-                # บล็อกทรัพยากรที่ไม่จำเป็น (รูป/ฟอนต์/ตัวติดตาม) ช่วยให้หน้าเว็บโหลดเร็วขึ้นมาก
-                try:
-                    driver.execute_cdp_cmd("Network.enable", {})
-                    driver.execute_cdp_cmd(
-                        "Network.setBlockedURLs",
-                        {
-                            "urls": [
-                                "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg", "*.ico",
-                                "*.woff", "*.woff2", "*.ttf", "*.eot",
-                                "*google-analytics*", "*googletagmanager*", "*doubleclick*",
-                                "*facebook*", "*hotjar*", "*clarity.ms*",
-                            ]
-                        },
-                    )
-                except Exception:
-                    pass
-                return driver
+        driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+        return driver
 
     raise RuntimeError("ไม่พบ Chrome หรือ Edge ในระบบ")
 
