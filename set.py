@@ -54,15 +54,15 @@ if hasattr(sys.stdout, "reconfigure"):
 # ==========================================
 IS_CI = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
 
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "2" if IS_CI else "6"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3" if IS_CI else "6"))
 HEADLESS_MODE = os.getenv("HEADLESS_MODE", "true").lower() != "false"
 WAIT_TIMEOUT = int(os.getenv("WAIT_TIMEOUT", "15" if IS_CI else "10"))
-DATA_WAIT_TIMEOUT = int(os.getenv("DATA_WAIT_TIMEOUT", "8"))
+DATA_WAIT_TIMEOUT = int(os.getenv("DATA_WAIT_TIMEOUT", "5"))
 PAGE_LOAD_TIMEOUT = int(os.getenv("PAGE_LOAD_TIMEOUT", "45"))
 MAX_URLS_PER_DRIVER = int(os.getenv("MAX_URLS_PER_DRIVER", "100"))
 MAX_RETRY_PER_URL = int(os.getenv("MAX_RETRY_PER_URL", "2"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.3" if IS_CI else "0.0"))
-MAX_VERIFY_ROUNDS = int(os.getenv("MAX_VERIFY_ROUNDS", "2"))
+MAX_VERIFY_ROUNDS = int(os.getenv("MAX_VERIFY_ROUNDS", "5"))
 
 # Path Configuration (ใช้ตำแหน่งไฟล์ set.py เป็นหลัก จึงรันได้ทั้ง Local และ GitHub Actions)
 BASE_DIR = Path(__file__).resolve().parent
@@ -472,32 +472,29 @@ def scrape_single_url(driver, url):
         )
     )
 
-    # สั่ง Scroll ลงมากลาง ๆ เพื่อกระตุ้น Lazy Load
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 3);")
+    # สั่ง Scroll ลงครึ่งหน้าเพื่อกระตุ้น Lazy Load ทั้งการ์ดกลางหน้าและงบการเงิน
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 2);")
 
-    # Smart Wait 3: รอจนกว่าข้อมูลจริงใน 5 การ์ดหลักจะโหลดเสร็จ (ไม่ใช่แค่กล่องเปล่าหรือ "ไม่มีข้อมูล")
+    # Smart Wait 3: รอจน 4 การ์ดหลักโหลดข้อมูลจริงเสร็จ (ต้องไม่มีคำว่า "ไม่มีข้อมูล" ปนอยู่)
     try:
         WebDriverWait(driver, DATA_WAIT_TIMEOUT).until(
             lambda d: d.execute_script(
                 """
                 const checks = [
-                    '.card-holder .card-minimal-body',
                     '.card-history .card-minimal-body',
                     '.card-stat .card-minimal-body',
                     '.card-yield .card-minimal-body',
-                    '.factsheet-financial .table-custom-field-main tbody'
+                    '.factsheet-financial .table-custom-field-main'
                 ];
-                let ready = 0;
                 for (const sel of checks) {
                     const el = document.querySelector(sel);
-                    if (el) {
-                        const txt = (el.innerText || '').trim();
-                        if (txt.length > 0 && txt !== 'ไม่มีข้อมูล' && !txt.includes('กำลังโหลด')) {
-                            ready++;
-                        }
+                    if (!el) return false;
+                    const txt = (el.innerText || '').trim();
+                    if (!txt || txt.includes('ไม่มีข้อมูล') || txt.includes('กำลังโหลด')) {
+                        return false;
                     }
                 }
-                return ready >= 5;
+                return true;
                 """
             )
         )
@@ -811,8 +808,8 @@ def script_a_check(save_summary=True, bases=None, expected_urls_by_file=None):
             out_path = folder / "_missing_data_summary.csv"
             all_df.to_csv(out_path, index=False, encoding="utf-8-sig")
             print(f"\n💾 บันทึกสรุปที่: {out_path}")
-        return all_df["URL"].nunique()
-    return 0
+        return set(all_df["URL"].dropna().astype(str).str.strip())
+    return set()
 
 
 def script_b_delete(apply_delete=True, bases=None):
@@ -910,9 +907,10 @@ def script_c_refresh():
             print(f"[SKIP] ข้าม {source_file} เพราะยังไม่มีไฟล์ปลายทาง")
             continue
 
+        time.sleep(2)
         retry_data = scrape_urls_parallel(
             urls_to_retry,
-            MAX_WORKERS,
+            min(2, MAX_WORKERS),
             action_label="Refreshed",
             show_rows=True,
         )
@@ -1080,17 +1078,31 @@ def main():
     print(f"STEP 2: ตรวจสอบและ Retry ข้อมูลที่ขาดหาย (สูงสุด {MAX_VERIFY_ROUNDS} รอบ)")
     print("=" * 50)
 
+    prev_missing_urls = None
+    unchanged_rounds = 0
     for verify_round in range(1, MAX_VERIFY_ROUNDS + 1):
         print(f"\n--- รอบตรวจสอบที่ {verify_round}/{MAX_VERIFY_ROUNDS} ---")
         print("\n[A] Check missing data...")
-        n_missing = script_a_check(
+        missing_urls = script_a_check(
             save_summary=True,
             bases=target_bases,
             expected_urls_by_file=expected_urls_by_file,
         )
-        if n_missing == 0:
+        if not missing_urls:
             print("✅ ข้อมูลครบถ้วนแล้ว ไม่ต้อง Retry เพิ่ม")
             break
+
+        if prev_missing_urls is not None and missing_urls == prev_missing_urls:
+            unchanged_rounds += 1
+            if unchanged_rounds >= 2:
+                print(
+                    f"⚠️ เหลือ {len(missing_urls)} หุ้นเดิมไม่เปลี่ยนแปลงติดกัน 2 รอบ "
+                    "(อาจไม่มีข้อมูลบนเว็บ SET จริง) — หยุด Retry"
+                )
+                break
+        else:
+            unchanged_rounds = 0
+        prev_missing_urls = missing_urls
 
         print("\n[B] Cascade delete incomplete data...")
         script_b_delete(apply_delete=True, bases=target_bases)
@@ -1100,14 +1112,6 @@ def main():
 
         print("\n[E] Cleanup summary file...")
         script_e_cleanup()
-
-    print("\n[D] Final verification...")
-    script_a_check(
-        save_summary=False,
-        bases=target_bases,
-        expected_urls_by_file=expected_urls_by_file,
-    )
-    script_e_cleanup()
 
     total = time.time() - start_time
     print(f"\n🎉 ทุกขั้นตอนเสร็จสิ้น รวมเวลา: {total / 60:.2f} นาที")
