@@ -54,12 +54,15 @@ if hasattr(sys.stdout, "reconfigure"):
 # ==========================================
 IS_CI = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
 
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5" if IS_CI else "6"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "2" if IS_CI else "6"))
 HEADLESS_MODE = os.getenv("HEADLESS_MODE", "true").lower() != "false"
-WAIT_TIMEOUT = int(os.getenv("WAIT_TIMEOUT", "10"))
+WAIT_TIMEOUT = int(os.getenv("WAIT_TIMEOUT", "15" if IS_CI else "10"))
+DATA_WAIT_TIMEOUT = int(os.getenv("DATA_WAIT_TIMEOUT", "8"))
 PAGE_LOAD_TIMEOUT = int(os.getenv("PAGE_LOAD_TIMEOUT", "45"))
 MAX_URLS_PER_DRIVER = int(os.getenv("MAX_URLS_PER_DRIVER", "100"))
-MAX_RETRY_PER_URL = int(os.getenv("MAX_RETRY_PER_URL", "1"))
+MAX_RETRY_PER_URL = int(os.getenv("MAX_RETRY_PER_URL", "2"))
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.3" if IS_CI else "0.0"))
+MAX_VERIFY_ROUNDS = int(os.getenv("MAX_VERIFY_ROUNDS", "2"))
 
 # Path Configuration (ใช้ตำแหน่งไฟล์ set.py เป็นหลัก จึงรันได้ทั้ง Local และ GitHub Actions)
 BASE_DIR = Path(__file__).resolve().parent
@@ -454,7 +457,7 @@ def parse_page_content(html_content, page_url):
 
 
 def scrape_single_url(driver, url):
-    """ดึงและแกะข้อมูล 1 URL ด้วย Smart Wait"""
+    """ดึงและแกะข้อมูล 1 URL ด้วย Smart Wait (รอจนข้อมูลจริงในแต่ละการ์ดโหลดครบ)"""
     driver.get(url)
 
     # Smart Wait 1: รอให้โครงสร้างหลักโผล่มาก่อน (Company Info)
@@ -472,11 +475,30 @@ def scrape_single_url(driver, url):
     # สั่ง Scroll ลงมากลาง ๆ เพื่อกระตุ้น Lazy Load
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 3);")
 
-    # Smart Wait 3: รอให้ตารางงบการเงินโผล่มา (ถ้าไม่มีงบจะผ่านไปเองหลัง 5 วิ)
+    # Smart Wait 3: รอจนกว่าข้อมูลจริงใน 5 การ์ดหลักจะโหลดเสร็จ (ไม่ใช่แค่กล่องเปล่าหรือ "ไม่มีข้อมูล")
     try:
-        WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, ".factsheet-financial, .table-custom-field-main")
+        WebDriverWait(driver, DATA_WAIT_TIMEOUT).until(
+            lambda d: d.execute_script(
+                """
+                const checks = [
+                    '.card-holder .card-minimal-body',
+                    '.card-history .card-minimal-body',
+                    '.card-stat .card-minimal-body',
+                    '.card-yield .card-minimal-body',
+                    '.factsheet-financial .table-custom-field-main tbody'
+                ];
+                let ready = 0;
+                for (const sel of checks) {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        const txt = (el.innerText || '').trim();
+                        if (txt.length > 0 && txt !== 'ไม่มีข้อมูล' && !txt.includes('กำลังโหลด')) {
+                            ready++;
+                        }
+                    }
+                }
+                return ready >= 5;
+                """
             )
         )
     except TimeoutException:
@@ -532,21 +554,25 @@ def scrape_urls_parallel(urls, max_workers, action_label="Scraped", show_rows=Fa
                         else:
                             print(f"  ⚠️ {action_label} (No Data): {symbol}")
                         urls_processed += 1
+                        if REQUEST_DELAY > 0:
+                            time.sleep(REQUEST_DELAY)
 
                     except TimeoutException:
                         with retry_lock:
                             count = retry_count.get(url, 0)
                             if count < MAX_RETRY_PER_URL:
                                 retry_count[url] = count + 1
+                                wait_sec = 3 * retry_count[url]
                                 print(
                                     f"  ❌ Timeout {symbol}: Retrying ({retry_count[url]}/{MAX_RETRY_PER_URL})"
                                 )
                                 url_queue.put(url)
                             else:
+                                wait_sec = 1
                                 print(
                                     f"  ❌ Error {url}: Timeout (Page did not load key elements)"
                                 )
-                        time.sleep(1)
+                        time.sleep(wait_sec)
 
                     except WebDriverException as e:
                         err_line = (e.msg or str(e)).split("\n")[0]
@@ -723,8 +749,8 @@ def _missing_condition(df):
     return mask_col1 | mask_col3
 
 
-def script_a_check(save_summary=True, bases=None):
-    """Script A/D: ตรวจสอบข้อมูลที่ขาดหาย และสร้างไฟล์ _missing_data_summary.csv"""
+def script_a_check(save_summary=True, bases=None, expected_urls_by_file=None):
+    """Script A/D: ตรวจสอบทั้งแถว 'ไม่มีข้อมูล' และหุ้นที่หายไปทั้งตัว แล้วสร้างไฟล์ _missing_data_summary.csv"""
     pd.set_option("display.max_colwidth", None)
     pd.set_option("display.expand_frame_repr", False)
 
@@ -733,41 +759,60 @@ def script_a_check(save_summary=True, bases=None):
     all_results = []
 
     for base in target_bases:
-        file_path = folder / f"{base}.csv"
+        source_file = f"{base}.csv"
+        file_path = folder / source_file
         print(f"\n===== {base} =====")
+        existing_urls = set()
+        df_missing_parts = []
+
         try:
             df = pd.read_csv(file_path, header=0, encoding="utf-8-sig", low_memory=False)
             df.columns = df.columns.astype(str).str.strip()
 
-            cond = _missing_condition(df)
-            if "TableName" not in df.columns or "URL" not in df.columns:
-                print("(ไม่มีคอลัมน์ TableName หรือ URL)")
-                continue
-
-            df_out = (
-                df.loc[cond, ["TableName", "URL"]]
-                .apply(lambda s: s.astype(str).str.strip())
-                .drop_duplicates()
-            )
-
-            if df_out.empty:
-                print("(ไม่พบรายการที่เข้าเงื่อนไข)")
+            if "TableName" in df.columns and "URL" in df.columns:
+                existing_urls = set(df["URL"].dropna().astype(str).str.strip())
+                cond = _missing_condition(df)
+                df_out = (
+                    df.loc[cond, ["TableName", "URL"]]
+                    .apply(lambda s: s.astype(str).str.strip())
+                    .drop_duplicates()
+                )
+                if not df_out.empty:
+                    df_missing_parts.append(df_out)
             else:
-                print(df_out.to_string(index=False))
-                tmp = df_out.copy()
-                tmp.insert(0, "SourceFile", f"{base}.csv")
-                all_results.append(tmp)
+                print("(ไม่มีคอลัมน์ TableName หรือ URL)")
 
         except FileNotFoundError:
             print(f"ไม่พบไฟล์: {file_path}")
         except Exception as e:
             print(f"เกิดข้อผิดพลาดกับไฟล์ {file_path}: {e}")
 
-    if all_results and save_summary:
+        # ตรวจหาหุ้นที่ Timeout หายไปทั้งตัว (ไม่มีอยู่ใน CSV เลย)
+        if expected_urls_by_file and source_file in expected_urls_by_file:
+            absent_urls = sorted(set(expected_urls_by_file[source_file]) - existing_urls)
+            if absent_urls:
+                df_absent = pd.DataFrame(
+                    {"TableName": "MISSING_URL", "URL": absent_urls}
+                )
+                df_missing_parts.append(df_absent)
+
+        if df_missing_parts:
+            df_combined = pd.concat(df_missing_parts, ignore_index=True).drop_duplicates()
+            print(df_combined.to_string(index=False))
+            tmp = df_combined.copy()
+            tmp.insert(0, "SourceFile", source_file)
+            all_results.append(tmp)
+        else:
+            print("(ไม่พบรายการที่เข้าเงื่อนไข)")
+
+    if all_results:
         all_df = pd.concat(all_results, ignore_index=True).drop_duplicates()
-        out_path = folder / "_missing_data_summary.csv"
-        all_df.to_csv(out_path, index=False, encoding="utf-8-sig")
-        print(f"\n💾 บันทึกสรุปที่: {out_path}")
+        if save_summary:
+            out_path = folder / "_missing_data_summary.csv"
+            all_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+            print(f"\n💾 บันทึกสรุปที่: {out_path}")
+        return all_df["URL"].nunique()
+    return 0
 
 
 def script_b_delete(apply_delete=True, bases=None):
@@ -1021,24 +1066,47 @@ def main():
     if args.skip_verify or not target_bases:
         return
 
-    # ---- STEP 2: VERIFY & RETRY ----
+    # สร้างรายการ URL ที่คาดว่าต้องมีครบทุกตัวในแต่ละไฟล์
+    expected_urls_by_file = {
+        SECTOR_NAME_MAP.get(sec_en, f"{sec_en.lower()}_company.csv"): [
+            f"https://www.set.or.th/th/market/product/stock/quote/{stock}/factsheet"
+            for stock in stocks
+        ]
+        for sec_en, stocks in sector_stocks
+    }
+
+    # ---- STEP 2: VERIFY & RETRY (สูงสุด MAX_VERIFY_ROUNDS รอบ) ----
     print("\n" + "=" * 50)
-    print("STEP 2: ตรวจสอบและ Retry ข้อมูลที่ขาดหาย")
+    print(f"STEP 2: ตรวจสอบและ Retry ข้อมูลที่ขาดหาย (สูงสุด {MAX_VERIFY_ROUNDS} รอบ)")
     print("=" * 50)
 
-    print("\n[A] Check missing data...")
-    script_a_check(save_summary=True, bases=target_bases)
+    for verify_round in range(1, MAX_VERIFY_ROUNDS + 1):
+        print(f"\n--- รอบตรวจสอบที่ {verify_round}/{MAX_VERIFY_ROUNDS} ---")
+        print("\n[A] Check missing data...")
+        n_missing = script_a_check(
+            save_summary=True,
+            bases=target_bases,
+            expected_urls_by_file=expected_urls_by_file,
+        )
+        if n_missing == 0:
+            print("✅ ข้อมูลครบถ้วนแล้ว ไม่ต้อง Retry เพิ่ม")
+            break
 
-    print("\n[B] Cascade delete incomplete data...")
-    script_b_delete(apply_delete=True, bases=target_bases)
+        print("\n[B] Cascade delete incomplete data...")
+        script_b_delete(apply_delete=True, bases=target_bases)
 
-    print("\n[C] Refresh missing data...")
-    script_c_refresh()
+        print("\n[C] Refresh missing data...")
+        script_c_refresh()
 
-    print("\n[D] Verify after refresh...")
-    script_a_check(save_summary=False, bases=target_bases)
+        print("\n[E] Cleanup summary file...")
+        script_e_cleanup()
 
-    print("\n[E] Cleanup summary file...")
+    print("\n[D] Final verification...")
+    script_a_check(
+        save_summary=False,
+        bases=target_bases,
+        expected_urls_by_file=expected_urls_by_file,
+    )
     script_e_cleanup()
 
     total = time.time() - start_time
